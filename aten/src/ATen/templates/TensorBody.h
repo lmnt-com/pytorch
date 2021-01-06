@@ -137,6 +137,9 @@ class TORCH_API Tensor {
     return strides()[dim];
   }
 
+  Tensor add(Scalar other, Scalar alpha=1) const;
+  Tensor& add_(Scalar other, Scalar alpha=1) const;
+
   TensorImpl * unsafeGetTensorImpl() const {
     return impl_.get();
   }
