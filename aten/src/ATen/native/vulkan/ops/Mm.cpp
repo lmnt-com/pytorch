@@ -1,5 +1,6 @@
 #include <ATen/native/vulkan/ops/Mm.h>
 #include <ATen/native/vulkan/ops/Persistent.h>
+#include <ATen/native/vulkan/ops/Packing.h>
 
 namespace at {
 namespace native {
@@ -49,24 +50,37 @@ vTensor pack_biases(
     return convert(*bias_arg);
   }
 
-  vTensor v_bias{
-      api::context(),
-      &pool,
-      {weight_arg.sizes()[Layout::Parameter::width]},
-      weight_arg.options(),
-  };
+  using Future = vTensor::Future<void, vTensor::Access::Write>;
+  if (bias_arg) {
+    vTensor v_bias{
+        api::context(),
+        &pool,
+        bias_arg->sizes(),
+        weight_arg.options(),
+    };
 
-  {
-    using Future = vTensor::Future<void, vTensor::Access::Write>;
-    Future v_bias_future = v_bias.host<void, vTensor::Access::Write>();
-    Future::Payload v_bias_payload = v_bias_future.wait();
+    {
+      Future v_bias_future = v_bias.host<void, vTensor::Access::Write>();
+      Future::Payload v_bias_payload = v_bias_future.wait();
 
-    if (bias_arg) {
       memcpy(
           v_bias_payload.get(),
           bias_arg->contiguous().data_ptr<float>(),
           std::min(bias_arg->nbytes(), v_bias.nbytes()));
-    } else {
+    }
+
+    return v_bias;
+  }
+  else {
+    vTensor v_bias{
+        api::context(),
+        &pool,
+        {1},
+        weight_arg.options(),
+    };
+    {
+      Future v_bias_future = v_bias.host<void, vTensor::Access::Write>();
+      Future::Payload v_bias_payload = v_bias_future.wait();
       memset(
           v_bias_payload.get(),
           // 2's complement integers and IEEE-754 floating point numbers both
@@ -75,9 +89,8 @@ vTensor pack_biases(
           0,
           v_bias.nbytes());
     }
+    return v_bias;
   }
-
-  return v_bias;
 }
 
 bool available(
@@ -137,80 +150,13 @@ Tensor addmm(
 Tensor mm(
     const Tensor& mat1_arg,
     const Tensor& mat2_arg) {
-  api::Context* const context = api::context();
-
-  const Tensor mat1 = mat1_arg.is_vulkan() ? mat1_arg : mat1_arg.vulkan();
-  const vTensor& v_mat1 = convert(mat1);
-
-  const Tensor mat2 = mat2_arg.is_vulkan() ? mat2_arg : mat2_arg.vulkan();
-  const vTensor& v_mat2 = convert(mat2);
-
-  const auto v_mat1_sizes = v_mat1.sizes();
-  const auto v_mat2_sizes = v_mat2.sizes();
-
-  TORCH_CHECK(
-      v_mat1_sizes[Layout::Parameter::width] ==
-          v_mat2_sizes[Layout::Parameter::height],
-      "Incompatible matrix dimensions!");
-
-  vTensor v_output{
-      context,
-      {
-          v_mat1_sizes[Layout::Parameter::height],
-          v_mat2_sizes[Layout::Parameter::width],
-      },
-      mat1.options(),
-  };
-
-  api::Command::Buffer command_buffer = context->command().pool.allocate();
-  command_buffer.begin();
-  {
-    if (v_mat1.has_image() && v_mat2.has_image()) {
-      const struct {
-        uvec3 size;
-        int32_t K;
-      } block {
-        v_output.extents(),
-        safe_downcast<int32_t>(v_mat1_sizes[Layout::Parameter::width]),
-      };
-
-      context->dispatch(
-          command_buffer,
-          {
-              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-              VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          },
-          VK_KERNEL(mm),
-          v_output.extents(),
-          // Write-only access bypasses synchronization but inserts appropriate
-          // barriers if necessary.
-          v_output.image(
-              command_buffer,
-              vTensor::Stage::Compute,
-              vTensor::Access::Write),
-          // Read-only access is implied on const tensors and triggers an async
-          // synchronization if necessary.
-          v_mat1.image(
-              command_buffer,
-              vTensor::Stage::Compute),
-          // Read-only access is implied on const tensors and triggers an async
-          // synchronization if necessary.
-          v_mat2.image(
-              command_buffer,
-              vTensor::Stage::Compute),
-          // Object lifetime is managed by the resource pool.
-          // It is OK not to keep track of the handle.
-          context->resource().pool.uniform(block).object);
-    } else {
-      TORCH_CHECK(false, "Not implemented!");
-    }
-  }
-  command_buffer.end();
-  command_buffer.submit(context->gpu().queue);
-
-  return convert(v_output);
+  return LinearOpContext::create(
+      api::context()->resource().pool,
+      mat2_arg,
+      c10::optional<Tensor>()).run(
+          mat1_arg,
+          1.0f,
+          1.0f);
 }
 
 #ifdef USE_VULKAN_API
@@ -231,10 +177,12 @@ LinearOpContext::LinearOpContext(
   : packed_{
       pack_weights(pool, weight),
       pack_biases(pool, weight, bias),
+      bias.has_value(),
     },
     unpacked_{
       weight,
       bias,
+      bias.has_value(),
     } {
 }
 
@@ -272,70 +220,131 @@ Tensor LinearOpContext::run(
       "combination with the provided weight and bias tensors are unsupported by "
       "Vulkan impl.");
 
-  vTensor v_output{
+  c10::SmallVector<int64_t, 4u> output_sizes{
+      v_input.sizes()[Layout::Parameter::height],
+      packed_.v_weight.sizes()[Layout::Parameter::width],
+  };
+
+  vTensor v_output_packed {
       context,
       {
-          v_input.sizes()[Layout::Parameter::height],
-          packed_.v_weight.sizes()[Layout::Parameter::width],
+        4,
+        div_up(v_input.sizes()[Layout::Parameter::height], INT64_C(2)),
+        div_up(packed_.v_weight.sizes()[Layout::Parameter::width], INT64_C(2)),
       },
       input.options(),
   };
 
+  api::Command::Buffer input_pack_buffer = context->command().pool.allocate();
+  input_pack_buffer.begin();
+  vTensor v_input_packed = pack_image2d_h2w2(v_input, context, input_pack_buffer);
+  vTensor v_weight_packed = pack_image2d_h2w2(packed_.v_weight, context, input_pack_buffer);
+  vTensor v_bias_packed = pack_image2d_h2w2(packed_.v_bias, context, input_pack_buffer);
+  input_pack_buffer.end();
+  input_pack_buffer.submit(context->gpu().queue);
+
   api::Command::Buffer command_buffer = context->command().pool.allocate();
   command_buffer.begin();
   {
-    if (v_output.has_image() &&
-        v_input.has_image() &&
+    if (v_input.has_image() &&
         packed_.v_weight.has_image() &&
         packed_.v_bias.has_image()) {
-      const struct {
-        uvec3 size;
-        int32_t K;
-        vec2 multiplier;
-      } block {
-          v_output.extents(),
-          safe_downcast<int32_t>(v_input.sizes()[Layout::Parameter::width]),
-          {
-            alpha,
-            beta,
-          },
-      };
+      if (packed_.has_bias) {
+        const struct {
+          uvec3 size;
+          int32_t K;
+          vec2 multiplier;
+        } block {
+            v_output_packed.extents(),
+            safe_downcast<int32_t>(div_up(v_input.sizes()[Layout::Parameter::width], INT64_C(2))),
+            {
+              alpha,
+              beta,
+            },
+        };
 
-      context->dispatch(
-          command_buffer,
-          {
-              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-              VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          },
-          VK_KERNEL(addmm),
-          v_output.extents(),
-          // Write-only access bypasses synchronization but inserts appropriate
-          // barriers if necessary.
-          v_output.image(
-              command_buffer,
-              vTensor::Stage::Compute,
-              vTensor::Access::Write),
-          // Read-only access is implied on const tensors and triggers an async
-          // synchronization if necessary.
-          v_input.image(
-              command_buffer,
-              vTensor::Stage::Compute),
-          // Read-only access is implied on const tensors and triggers an async
-          // synchronization if necessary.
-          packed_.v_weight.image(
-              command_buffer,
-              vTensor::Stage::Compute),
-          // Read-only access is implied on const tensors and triggers an async
-          // synchronization if necessary.
-          packed_.v_bias.image(
-              command_buffer,
-              vTensor::Stage::Compute),
-          // Object lifetime is managed by the resource pool.
-          // It is OK not to keep track of the handle.
-          context->resource().pool.uniform(block).object);
+        context->dispatch(
+            command_buffer,
+            {
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            },
+            VK_KERNEL(addmm),
+            v_output_packed.extents(),
+            {8, 8, 1},
+            // Write-only access bypasses synchronization but inserts appropriate
+            // barriers if necessary.
+            v_output_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Write),
+            // Read-only access is implied on const tensors and triggers an async
+            // synchronization if necessary.
+            v_input_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Read),
+            // Read-only access is implied on const tensors and triggers an async
+            // synchronization if necessary.
+            v_weight_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Read),
+            // Read-only access is implied on const tensors and triggers an async
+            // synchronization if necessary.
+            v_bias_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Read),
+            // Object lifetime is managed by the resource pool.
+            // It is OK not to keep track of the handle.
+            context->resource().pool.uniform(block).object);
+      }
+      else {
+        const struct {
+          uvec3 size;
+          int32_t K;
+        } block_no_bias {
+            v_output_packed.extents(),
+            safe_downcast<int32_t>(div_up(v_input.sizes()[Layout::Parameter::width], INT64_C(2))),
+        };
+
+        context->dispatch(
+            command_buffer,
+            {
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            },
+            VK_KERNEL(mm),
+            v_output_packed.extents(),
+            {8, 8, 1},
+            // Write-only access bypasses synchronization but inserts appropriate
+            // barriers if necessary.
+            v_output_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Write),
+            // Read-only access is implied on const tensors and triggers an async
+            // synchronization if necessary.
+            v_input_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Read),
+            // Read-only access is implied on const tensors and triggers an async
+            // synchronization if necessary.
+            v_weight_packed.image(
+                command_buffer,
+                vTensor::Stage::Compute,
+                vTensor::Access::Read),
+            // Object lifetime is managed by the resource pool.
+            // It is OK not to keep track of the handle.
+            context->resource().pool.uniform(block_no_bias).object);
+      }
     }
     else {
       TORCH_CHECK(false, "Not implemented!");
@@ -343,6 +352,12 @@ Tensor LinearOpContext::run(
   }
   command_buffer.end();
   command_buffer.submit(context->gpu().queue);
+
+  api::Command::Buffer output_unpack_buffer = context->command().pool.allocate();
+  output_unpack_buffer.begin();
+  vTensor v_output = unpack_image2d_h2w2(v_output_packed, output_sizes, context, output_unpack_buffer);
+  output_unpack_buffer.end();
+  output_unpack_buffer.submit(context->gpu().queue);
 
   return convert(v_output);
 }
